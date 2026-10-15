@@ -16,6 +16,10 @@
  */
 package org.jkiss.dbeaver.ui.app.standalone;
 
+import com.sun.jna.Native;
+import com.sun.jna.WString;
+import com.sun.jna.win32.StdCallLibrary;
+import com.sun.jna.win32.W32APIOptions;
 import org.eclipse.core.internal.net.ProxyManager;
 import org.eclipse.core.net.proxy.IProxyService;
 import org.eclipse.core.runtime.preferences.DefaultScope;
@@ -218,6 +222,9 @@ public class ApplicationWorkbenchAdvisor extends IDEWorkbenchAdvisor {
 
     private final OpenEventProcessor processor;
 
+    // Set while Windows is ending the session (log off, shutdown, restart)
+    private volatile boolean sessionEnding;
+
     private final SystemEventListener systemSleepListener = new SystemSleepListener() {
         @Override
         public void systemAboutToSleep(SystemSleepEvent e) {
@@ -324,6 +331,53 @@ public class ApplicationWorkbenchAdvisor extends IDEWorkbenchAdvisor {
         if (DBWorkbench.getPlatform() instanceof DesktopPlatform platformDesktop) {
             platformDesktop.setWorkbenchStarted(true);
         }
+
+        if (RuntimeUtils.isWindows()) {
+            registerWindowsRestart();
+            trackSessionEnd();
+        }
+    }
+
+    /**
+     * Asks Windows to relaunch DBeaver after a reboot or update if it was running at shutdown.
+     * The workbench then restores windows and editors from its saved state.
+     */
+    private static void registerWindowsRestart() {
+        try {
+            int result = WindowsKernel32.INSTANCE.RegisterApplicationRestart(
+                null,
+                WindowsKernel32.RESTART_NO_CRASH | WindowsKernel32.RESTART_NO_HANG
+            );
+            if (result != 0) {
+                log.debug("RegisterApplicationRestart failed with HRESULT 0x" + Integer.toHexString(result));
+            }
+        } catch (Throwable e) {
+            log.debug("Error registering application restart", e);
+        }
+    }
+
+    /**
+     * Windows delivers a log off, shutdown or restart as a display close event.
+     * Remember it so shutdown does not show confirmations that would block the session end.
+     */
+    private void trackSessionEnd() {
+        Display display = Display.getCurrent();
+        if (display == null) {
+            return;
+        }
+        display.addFilter(SWT.Close, event -> {
+            sessionEnding = true;
+            display.asyncExec(() -> sessionEnding = false);
+        });
+    }
+
+    private interface WindowsKernel32 extends StdCallLibrary {
+        int RESTART_NO_CRASH = 1;
+        int RESTART_NO_HANG = 2;
+
+        WindowsKernel32 INSTANCE = Native.load("kernel32", WindowsKernel32.class, W32APIOptions.DEFAULT_OPTIONS);
+
+        int RegisterApplicationRestart(WString commandLine, int flags);
     }
 
     private void filterPreferencePages() {
@@ -469,11 +523,11 @@ public class ApplicationWorkbenchAdvisor extends IDEWorkbenchAdvisor {
         try {
             IWorkbenchWindow window = getWorkbenchConfigurer().getWorkbench().getActiveWorkbenchWindow();
             if (window != null) {
-                if (!ApplicationWorkbenchAdvisor.closeOpenEditors(window, false, true)) {
+                if (!ApplicationWorkbenchAdvisor.closeOpenEditors(window, false, !sessionEnding)) {
                     return false;
                 }
             }
-            return ApplicationWorkbenchAdvisor.cancelRunningTasks(true) && ApplicationWorkbenchAdvisor.closeActiveTransactions(false);
+            return ApplicationWorkbenchAdvisor.cancelRunningTasks(!sessionEnding) && ApplicationWorkbenchAdvisor.closeActiveTransactions(false);
         } catch (Throwable e) {
             log.error(e);
             return true;
